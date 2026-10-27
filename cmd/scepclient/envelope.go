@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"crypto"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
@@ -24,6 +25,9 @@ var (
 	oidAES128CBC = asn1.ObjectIdentifier{2, 16, 840, 1, 101, 3, 4, 1, 2}
 	oidAES192CBC = asn1.ObjectIdentifier{2, 16, 840, 1, 101, 3, 4, 1, 22}
 	oidAES256CBC = asn1.ObjectIdentifier{2, 16, 840, 1, 101, 3, 4, 1, 42}
+
+	oidMGF1       = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 1, 8}
+	oidPSpecified = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 1, 9}
 )
 
 // aesCBC is an AES-CBC content encryption algorithm.
@@ -173,19 +177,15 @@ func decryptEnvelope(der []byte, cert *x509.Certificate, key *rsa.PrivateKey) ([
 	if recipient == nil {
 		return nil, errors.New("envelope: no recipient info for the signer certificate")
 	}
-	if !recipient.KeyEncryptionAlgorithm.Algorithm.Equal(pkcs7.OIDEncryptionAlgorithmRSA) {
-		return nil, fmt.Errorf("envelope: unsupported key encryption algorithm %s", recipient.KeyEncryptionAlgorithm.Algorithm)
-	}
-
 	eci := ed.EncryptedContentInfo
 	alg, ok := aesCBCByOID(eci.ContentEncryptionAlgorithm.Algorithm)
 	if !ok {
 		return nil, fmt.Errorf("envelope: unsupported content encryption algorithm %s", eci.ContentEncryptionAlgorithm.Algorithm)
 	}
 
-	contentKey, err := rsa.DecryptPKCS1v15(nil, key, recipient.EncryptedKey)
+	contentKey, err := decryptContentKey(recipient, key)
 	if err != nil {
-		return nil, fmt.Errorf("envelope: decrypt content key: %w", err)
+		return nil, err
 	}
 	if len(contentKey) != alg.keyLen {
 		return nil, errors.New("envelope: content key has the wrong length")
@@ -215,6 +215,105 @@ func decryptEnvelope(der []byte, cert *x509.Certificate, key *rsa.PrivateKey) ([
 	cipher.NewCBCDecrypter(block, iv).CryptBlocks(plaintext, ciphertext)
 
 	return pkcs7Unpad(plaintext, aes.BlockSize)
+}
+
+// decryptContentKey unwraps the content key with RSA PKCS #1 v1.5 or RSAES-OAEP
+// (NDES answers AES-192 requests with OAEP).
+func decryptContentKey(recipient *recipientInfo, key *rsa.PrivateKey) ([]byte, error) {
+	var contentKey []byte
+	var err error
+	switch alg := recipient.KeyEncryptionAlgorithm; {
+	case alg.Algorithm.Equal(pkcs7.OIDEncryptionAlgorithmRSA):
+		contentKey, err = rsa.DecryptPKCS1v15(nil, key, recipient.EncryptedKey)
+	case alg.Algorithm.Equal(pkcs7.OIDEncryptionAlgorithmRSAESOAEP):
+		hash, label, perr := oaepParameters(alg.Parameters)
+		if perr != nil {
+			return nil, perr
+		}
+		contentKey, err = rsa.DecryptOAEP(hash.New(), nil, key, recipient.EncryptedKey, label)
+	default:
+		return nil, fmt.Errorf("envelope: unsupported key encryption algorithm %s", alg.Algorithm)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("envelope: decrypt content key: %w", err)
+	}
+	return contentKey, nil
+}
+
+// rsaOAEPParameters is RSAES-OAEP-params (RFC 8017, appendix A.2.1). Absent
+// fields default to SHA-1, MGF1 with SHA-1 and an empty label.
+type rsaOAEPParameters struct {
+	HashFunc    pkix.AlgorithmIdentifier `asn1:"optional,explicit,tag:0"`
+	MaskGenFunc pkix.AlgorithmIdentifier `asn1:"optional,explicit,tag:1"`
+	PSourceFunc pkix.AlgorithmIdentifier `asn1:"optional,explicit,tag:2"`
+}
+
+func oaepParameters(raw asn1.RawValue) (crypto.Hash, []byte, error) {
+	var params rsaOAEPParameters
+	if len(raw.FullBytes) > 0 && !bytes.Equal(raw.FullBytes, asn1.NullBytes) {
+		rest, err := asn1.Unmarshal(raw.FullBytes, &params)
+		if err != nil {
+			return 0, nil, fmt.Errorf("envelope: parse RSAES-OAEP parameters: %w", err)
+		}
+		if len(rest) != 0 {
+			return 0, nil, errors.New("envelope: trailing data after RSAES-OAEP parameters")
+		}
+	}
+
+	hash := crypto.SHA1
+	if len(params.HashFunc.Algorithm) > 0 {
+		var err error
+		if hash, err = oaepHash(params.HashFunc.Algorithm); err != nil {
+			return 0, nil, err
+		}
+	}
+
+	mgfHash := crypto.SHA1
+	if len(params.MaskGenFunc.Algorithm) > 0 {
+		if !params.MaskGenFunc.Algorithm.Equal(oidMGF1) {
+			return 0, nil, fmt.Errorf("envelope: unsupported RSAES-OAEP mask generation function %s", params.MaskGenFunc.Algorithm)
+		}
+		var mgfDigest pkix.AlgorithmIdentifier
+		if _, err := asn1.Unmarshal(params.MaskGenFunc.Parameters.FullBytes, &mgfDigest); err != nil {
+			return 0, nil, fmt.Errorf("envelope: parse MGF1 parameters: %w", err)
+		}
+		var err error
+		if mgfHash, err = oaepHash(mgfDigest.Algorithm); err != nil {
+			return 0, nil, err
+		}
+	}
+	// rsa.DecryptOAEP uses one hash for both, as do the CMS implementations seen in practice
+	if mgfHash != hash {
+		return 0, nil, errors.New("envelope: RSAES-OAEP with different OAEP and MGF1 hashes is not supported")
+	}
+
+	var label []byte
+	if len(params.PSourceFunc.Algorithm) > 0 {
+		if !params.PSourceFunc.Algorithm.Equal(oidPSpecified) {
+			return 0, nil, fmt.Errorf("envelope: unsupported RSAES-OAEP label source %s", params.PSourceFunc.Algorithm)
+		}
+		if _, err := asn1.Unmarshal(params.PSourceFunc.Parameters.FullBytes, &label); err != nil {
+			return 0, nil, fmt.Errorf("envelope: parse RSAES-OAEP label: %w", err)
+		}
+	}
+
+	return hash, label, nil
+}
+
+func oaepHash(oid asn1.ObjectIdentifier) (crypto.Hash, error) {
+	switch {
+	case oid.Equal(pkcs7.OIDDigestAlgorithmSHA1):
+		return crypto.SHA1, nil
+	case oid.Equal(pkcs7.OIDDigestAlgorithmSHA224):
+		return crypto.SHA224, nil
+	case oid.Equal(pkcs7.OIDDigestAlgorithmSHA256):
+		return crypto.SHA256, nil
+	case oid.Equal(pkcs7.OIDDigestAlgorithmSHA384):
+		return crypto.SHA384, nil
+	case oid.Equal(pkcs7.OIDDigestAlgorithmSHA512):
+		return crypto.SHA512, nil
+	}
+	return 0, fmt.Errorf("envelope: unsupported RSAES-OAEP hash %s", oid)
 }
 
 // encryptedContentBytes returns the ciphertext of an [0] IMPLICIT OCTET STRING,
